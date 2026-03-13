@@ -18,10 +18,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	xdscreds "google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/reflection"
-	"google.golang.org/grpc/xds"
 )
 
 var (
@@ -141,7 +139,6 @@ func main() {
 	flag.Parse()
 
 	// Set custom gRPC logger to filter out xDS informational logs
-	// The "ERROR: [xds] Listener entering mode: SERVING" is actually an informational log
 	grpclog.SetLoggerV2(&logger.GrpcLogger{
 		Logger: log.New(os.Stderr, "", log.LstdFlags),
 	})
@@ -176,29 +173,13 @@ func main() {
 		log.Printf("GRPC_XDS_BOOTSTRAP not set, using default: %s", bootstrapPath)
 	}
 
-	// Wait for bootstrap file to exist before creating xDS server
+	// Wait for bootstrap file to exist before starting server
 	// The dubbo-proxy sidecar needs time to generate this file
 	if err := waitForBootstrapFile(bootstrapPath, 60*time.Second); err != nil {
 		log.Fatalf("Failed to wait for bootstrap file: %v", err)
 	}
 
-	// Create xDS-enabled gRPC server
-	// For proxyless gRPC, we use xds.NewGRPCServer() instead of grpc.NewServer()
-	// NOTE: FallbackCreds is REQUIRED by gRPC xDS library for initial connection
-	// before xDS configuration is available. However, once xDS configures TLS,
-	// the server will use TLS and will NOT fallback to plaintext if TLS fails.
-	// FallbackCreds is only used when xDS has not yet provided TLS configuration.
-	creds, err := xdscreds.NewServerCredentials(xdscreds.ServerOptions{
-		FallbackCreds: insecure.NewCredentials(),
-	})
-	if err != nil {
-		log.Fatalf("Failed to create xDS server credentials: %v", err)
-	}
-
-	server, err := xds.NewGRPCServer(grpc.Creds(creds))
-	if err != nil {
-		log.Fatalf("Failed to create xDS gRPC server: %v", err)
-	}
+	server := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 
 	es := &echoServer{
 		hostname:       hostname,
@@ -218,7 +199,7 @@ func main() {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	log.Printf("Starting gRPC proxyless server on port %d (hostname: %s)", *port, hostname)
+	log.Printf("Starting gRPC server on port %d (hostname: %s)", *port, hostname)
 
 	go func() {
 		sigChan := make(chan os.Signal, 1)
@@ -228,11 +209,7 @@ func main() {
 		server.GracefulStop()
 	}()
 
-	// Serve the gRPC server
-	// Note: server.Serve returns when the listener is closed, which is normal during shutdown
-	// Connection reset errors are handled by the gRPC library and logged separately
 	if err := server.Serve(lis); err != nil {
-		// Only log as fatal if it's not a normal shutdown (listener closed)
 		if !strings.Contains(err.Error(), "use of closed network connection") {
 			log.Fatalf("Failed to serve: %v", err)
 		}
