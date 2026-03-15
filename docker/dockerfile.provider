@@ -1,5 +1,4 @@
-FROM gcr.io/distroless/static
-ARG TARGETARCH
-COPY bin/grpc-provider-${TARGETARCH} /usr/local/bin/grpc-provider
+FROM golang:1.25
+COPY bin/grpc-provider /usr/local/bin/grpc-provider
 USER 1234:1234
 ENTRYPOINT ["/usr/local/bin/grpc-provider"]

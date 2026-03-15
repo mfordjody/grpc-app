@@ -22,6 +22,7 @@ import (
 	"grpc-app/logger"
 	pb "grpc-app/proto"
 	"grpc-app/util"
+	_ "github.com/dubbo-kubernetes/xds-api/grpc/resolver"
 )
 
 var (
@@ -179,7 +180,17 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 			log.Printf("ForwardEcho: creating new connection for %s...", req.Url)
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
 			var dialErr error
-			conn, dialErr = grpc.DialContext(dialCtx, req.Url, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			conn, dialErr = grpc.DialContext(dialCtx, req.Url,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
+				grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+					// 剥掉 xDS resolver 加的 #N 权重后缀，建立真实连接
+					if idx := strings.LastIndex(addr, "#"); idx >= 0 {
+						addr = addr[:idx]
+					}
+					return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+				}),
+			)
 			dialCancel()
 			if dialErr != nil {
 				s.connMutex.Unlock()

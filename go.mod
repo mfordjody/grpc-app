@@ -3,10 +3,12 @@ module grpc-app
 go 1.25.0
 
 require (
-	github.com/dubbo-kubernetes/xds-api v0.0.0-20260228103100-7a9ab7bac3bb
+	github.com/dubbo-kubernetes/xds-api v0.0.0-20260315061837-33238918985b
 	google.golang.org/grpc v1.79.1
 	google.golang.org/protobuf v1.36.11
 )
+
+replace github.com/dubbo-kubernetes/xds-api v0.0.0-20260315061837-33238918985b => ./xds-api
 
 require (
 	golang.org/x/net v0.48.0 // indirect
