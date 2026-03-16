@@ -149,7 +149,7 @@ func buildServerOpts(tlsCfg *xdsserver.InboundTLSConfig, certDir string) ([]grpc
 	return []grpc.ServerOption{grpc.Creds(creds)}, tlsMgr.Stop
 }
 
-func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stopCh <-chan struct{}) {
+func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stopCh <-chan struct{}) error {
 	server := grpc.NewServer(opts...)
 	pb.RegisterEchoServiceServer(server, es)
 	pb.RegisterEchoTestServiceServer(server, es)
@@ -157,7 +157,7 @@ func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stop
 
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
+		return fmt.Errorf("Failed to listen on %s: %v", listenAddr, err)
 	}
 	log.Printf("[provider] gRPC server listening on %s", listenAddr)
 
@@ -172,6 +172,7 @@ func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stop
 			log.Printf("[provider] server error: %v", err)
 		}
 	}
+	return nil
 }
 
 func main() {
@@ -256,27 +257,37 @@ func main() {
 
 	for {
 		stopCh := make(chan struct{})
-		go runServer(serverOpts, es, listenAddr, stopCh)
+		serverDone := make(chan struct{})
+		go func(opts []grpc.ServerOption, sCh <-chan struct{}, done chan<- struct{}) {
+			defer close(done)
+			if err := runServer(opts, es, listenAddr, sCh); err != nil {
+				log.Printf("[provider] runServer error: %v", err)
+			}
+		}(serverOpts, stopCh, serverDone)
 
 		// Wait for TLS config change or OS signal.
 		select {
 		case <-sigChan:
 			log.Println("[provider] shutting down")
 			close(stopCh)
+			<-serverDone
 			stopFn()
 			return
 
 		case update := <-watcher.UpdateCh():
 			if update.Mode == currentMode {
-				// Same mode, no restart needed.
+				// Same mode, no restart needed — drain serverDone if server exited.
+				select {
+				case <-serverDone:
+				default:
+				}
 				continue
 			}
 			log.Printf("[provider] xDS TLS mode changed (%v -> %v), restarting server",
 				currentMode, update.Mode)
 			close(stopCh)
+			<-serverDone // wait for port to be fully released
 			stopFn()
-			// Brief pause to allow port to be released.
-			time.Sleep(200 * time.Millisecond)
 			currentMode = update.Mode
 			serverOpts, stopFn = buildServerOpts(update, certDir)
 		}
