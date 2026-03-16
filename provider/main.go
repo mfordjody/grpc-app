@@ -124,10 +124,11 @@ func (s *echoServer) ForwardEcho(ctx context.Context, req *pb.ForwardEchoRequest
 }
 
 // buildServerOpts resolves gRPC server credentials from the xDS inbound TLS config.
-func buildServerOpts(tlsCfg *xdsserver.InboundTLSConfig, certDir string) []grpc.ServerOption {
+// The returned stopFn must be called when the server stops to release resources.
+func buildServerOpts(tlsCfg *xdsserver.InboundTLSConfig, certDir string) ([]grpc.ServerOption, func()) {
 	if tlsCfg == nil || tlsCfg.Mode != xdsserver.TLSModeMTLS {
 		log.Printf("[provider] xDS inbound listener: plaintext mode")
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}
+		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
 	}
 
 	log.Printf("[provider] xDS inbound listener: mTLS mode, loading certs from %s", certDir)
@@ -136,16 +137,16 @@ func buildServerOpts(tlsCfg *xdsserver.InboundTLSConfig, certDir string) []grpc.
 	if err != nil {
 		log.Printf("[provider] failed to apply DownstreamTlsContext: %v, falling back to insecure", err)
 		tlsMgr.Stop()
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}
+		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
 	}
 	creds, err := certProvider.GetServerCredentials()
 	if err != nil {
 		log.Printf("[provider] failed to build server TLS credentials: %v, falling back to insecure", err)
 		tlsMgr.Stop()
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}
+		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
 	}
 	log.Printf("[provider] mTLS server credentials ready")
-	return []grpc.ServerOption{grpc.Creds(creds)}
+	return []grpc.ServerOption{grpc.Creds(creds)}, tlsMgr.Stop
 }
 
 func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stopCh <-chan struct{}) {
@@ -251,7 +252,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	currentMode := initTLS.Mode
-	serverOpts := buildServerOpts(initTLS, certDir)
+	serverOpts, stopFn := buildServerOpts(initTLS, certDir)
 
 	for {
 		stopCh := make(chan struct{})
@@ -262,6 +263,7 @@ func main() {
 		case <-sigChan:
 			log.Println("[provider] shutting down")
 			close(stopCh)
+			stopFn()
 			return
 
 		case update := <-watcher.UpdateCh():
@@ -272,10 +274,11 @@ func main() {
 			log.Printf("[provider] xDS TLS mode changed (%v -> %v), restarting server",
 				currentMode, update.Mode)
 			close(stopCh)
+			stopFn()
 			// Brief pause to allow port to be released.
 			time.Sleep(200 * time.Millisecond)
 			currentMode = update.Mode
-			serverOpts = buildServerOpts(update, certDir)
+			serverOpts, stopFn = buildServerOpts(update, certDir)
 		}
 	}
 }
