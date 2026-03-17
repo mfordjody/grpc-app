@@ -28,6 +28,16 @@ import (
 	"grpc-app/util"
 )
 
+// stripSuffixDialer strips the "#N" suffix that xds-api resolver appends to
+// make weighted round-robin slots distinct. The actual TCP dial uses the real
+// host:port without the suffix.
+func stripSuffixDialer(ctx context.Context, addr string) (net.Conn, error) {
+	if idx := strings.LastIndex(addr, "#"); idx >= 0 {
+		addr = addr[:idx]
+	}
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+}
+
 var (
 	port       = flag.Int("port", 17171, "gRPC server port for ForwardEcho testing")
 	testServer *grpc.Server
@@ -170,10 +180,11 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 		if c, ok := s.connCache[req.Url]; !ok || c == nil || c.conn == nil {
 			log.Printf("ForwardEcho: creating new connection for %s...", req.Url)
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			// xds:/// resolver (registered by xds-api/grpc/resolver) handles endpoint
-			// resolution and injects round_robin via ServiceConfig.
+			// xds:/// resolver injects round_robin + #N suffix for weighted slots.
+			// stripSuffixDialer removes the suffix before the actual TCP dial.
 			newConn, dialErr := grpc.DialContext(dialCtx, req.Url,
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithContextDialer(stripSuffixDialer),
 			)
 			dialCancel()
 			if dialErr != nil {
