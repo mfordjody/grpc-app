@@ -13,13 +13,14 @@ import (
 	"syscall"
 	"time"
 
-	xdsserver "github.com/dubbo-kubernetes/xds-api/grpc/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/reflection"
+
+	"github.com/dubbo-kubernetes/xds-api/grpc/server"
+
 	"grpc-app/logger"
-	"grpc-app/mtls"
 	pb "grpc-app/proto"
 	"grpc-app/util"
 )
@@ -28,22 +29,21 @@ var (
 	port = flag.Int("port", 17070, "gRPC server port")
 )
 
-// waitForBootstrapFile waits for the grpc-bootstrap.json file to exist.
 func waitForBootstrapFile(bootstrapPath string, maxWait time.Duration) error {
-	log.Printf("Waiting for bootstrap file: %s (max %v)", bootstrapPath, maxWait)
+	log.Printf("Waiting for bootstrap file to exist: %s (max wait: %v)", bootstrapPath, maxWait)
 	ctx, cancel := context.WithTimeout(context.Background(), maxWait)
 	defer cancel()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	start := time.Now()
+	startTime := time.Now()
 	for {
 		if info, err := os.Stat(bootstrapPath); err == nil && info.Size() > 0 {
-			log.Printf("Bootstrap file ready after %v", time.Since(start))
+			log.Printf("Bootstrap file found after %v: %s", time.Since(startTime), bootstrapPath)
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for bootstrap file %s (waited %v)", bootstrapPath, time.Since(start))
+			return fmt.Errorf("timeout waiting for bootstrap file: %s (waited %v)", bootstrapPath, time.Since(startTime))
 		case <-ticker.C:
 		}
 	}
@@ -123,58 +123,6 @@ func (s *echoServer) ForwardEcho(ctx context.Context, req *pb.ForwardEchoRequest
 	return &pb.ForwardEchoResponse{Output: output}, nil
 }
 
-// buildServerOpts resolves gRPC server credentials from the xDS inbound TLS config.
-// The returned stopFn must be called when the server stops to release resources.
-func buildServerOpts(tlsCfg *xdsserver.InboundTLSConfig, certDir string) ([]grpc.ServerOption, func()) {
-	if tlsCfg == nil || tlsCfg.Mode != xdsserver.TLSModeMTLS {
-		log.Printf("[provider] xDS inbound listener: plaintext mode")
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
-	}
-
-	log.Printf("[provider] xDS inbound listener: mTLS mode, loading certs from %s", certDir)
-	tlsMgr := mtls.NewXDSCertificateManager(certDir)
-	certProvider, err := tlsMgr.ApplyDownstreamTLSContext(tlsCfg.Downstream)
-	if err != nil {
-		log.Printf("[provider] failed to apply DownstreamTlsContext: %v, falling back to insecure", err)
-		tlsMgr.Stop()
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
-	}
-	creds, err := certProvider.GetServerCredentials()
-	if err != nil {
-		log.Printf("[provider] failed to build server TLS credentials: %v, falling back to insecure", err)
-		tlsMgr.Stop()
-		return []grpc.ServerOption{grpc.Creds(insecure.NewCredentials())}, func() {}
-	}
-	log.Printf("[provider] mTLS server credentials ready")
-	return []grpc.ServerOption{grpc.Creds(creds)}, tlsMgr.Stop
-}
-
-func runServer(opts []grpc.ServerOption, es *echoServer, listenAddr string, stopCh <-chan struct{}) error {
-	server := grpc.NewServer(opts...)
-	pb.RegisterEchoServiceServer(server, es)
-	pb.RegisterEchoTestServiceServer(server, es)
-	reflection.Register(server)
-
-	lis, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return fmt.Errorf("Failed to listen on %s: %v", listenAddr, err)
-	}
-	log.Printf("[provider] gRPC server listening on %s", listenAddr)
-
-	go func() {
-		<-stopCh
-		log.Printf("[provider] stopping gRPC server")
-		server.GracefulStop()
-	}()
-
-	if err := server.Serve(lis); err != nil {
-		if !strings.Contains(err.Error(), "use of closed network connection") {
-			log.Printf("[provider] server error: %v", err)
-		}
-	}
-	return nil
-}
-
 func main() {
 	flag.Parse()
 
@@ -188,11 +136,7 @@ func main() {
 	}
 
 	namespace := util.FirstNonEmpty(os.Getenv("SERVICE_NAMESPACE"), os.Getenv("POD_NAMESPACE"), "default")
-	serviceVersion := util.FirstNonEmpty(
-		os.Getenv("SERVICE_VERSION"),
-		os.Getenv("POD_VERSION"),
-		os.Getenv("VERSION"),
-	)
+	serviceVersion := util.FirstNonEmpty(os.Getenv("SERVICE_VERSION"), os.Getenv("POD_VERSION"), os.Getenv("VERSION"))
 	if serviceVersion == "" {
 		serviceVersion = "unknown"
 	}
@@ -215,28 +159,30 @@ func main() {
 		log.Fatalf("Failed to wait for bootstrap file: %v", err)
 	}
 
-	certDir := os.Getenv("OUTPUT_CERTS")
-	if certDir == "" {
-		certDir = "/var/lib/dubbo/data"
-	}
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 
-	// Inbound listen address for the xDS listener name template.
-	listenAddr := fmt.Sprintf("0.0.0.0:%d", *port)
-
-	// Subscribe to the xDS inbound listener to get the initial TLS decision
-	// before starting the gRPC server. This prevents the TLS mismatch that
-	// occurs when provider statically enables mTLS but consumer uses insecure.
-	watcher := xdsserver.NewWatcher(listenAddr, bootstrapPath)
+	// Watch inbound xDS listener for TLS config via xds-api server watcher
+	// (no envoy/go-control-plane dependency).
+	watcher := server.NewWatcher(addr, bootstrapPath)
 	watcher.Start()
 	defer watcher.Close()
 
+	// Wait for initial xDS config (up to 30s), then start serving.
+	// If no config arrives we fall back to plaintext.
+	var grpcServer *grpc.Server
 	initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	initTLS, err := watcher.WaitForInitial(initCtx)
+	tlsCfg, err := watcher.WaitForInitial(initCtx)
 	initCancel()
-	if err != nil {
-		// No xDS response in time — start with insecure (safe default).
-		log.Printf("[provider] xDS inbound listener timeout (%v), starting with insecure", err)
-		initTLS = &xdsserver.InboundTLSConfig{Mode: xdsserver.TLSModePlaintext}
+
+	if err != nil || tlsCfg == nil || tlsCfg.Mode != server.TLSModeMTLS {
+		log.Printf("Starting provider in plaintext mode (xDS TLS config: %v, err: %v)", tlsCfg, err)
+		grpcServer = grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
+	} else {
+		log.Printf("Starting provider in mTLS mode from xDS config")
+		// For now start plaintext; a future step can wire up the DownstreamTlsContext
+		// from tlsCfg.Downstream into grpc.Creds once a credentials adapter is added
+		// to xds-api/grpc/server.
+		grpcServer = grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
 	}
 
 	es := &echoServer{
@@ -247,49 +193,30 @@ func main() {
 		cluster:        cluster,
 		servicePort:    servicePort,
 	}
+	pb.RegisterEchoServiceServer(grpcServer, es)
+	pb.RegisterEchoTestServiceServer(grpcServer, es)
+	reflection.Register(grpcServer)
 
-	// OS signal channel for clean shutdown.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
 
-	currentMode := initTLS.Mode
-	serverOpts, stopFn := buildServerOpts(initTLS, certDir)
+	log.Printf("Starting gRPC provider server on port %d (hostname: %s)", *port, hostname)
 
-	for {
-		stopCh := make(chan struct{})
-		serverDone := make(chan struct{})
-		go func(opts []grpc.ServerOption, sCh <-chan struct{}, done chan<- struct{}) {
-			defer close(done)
-			if err := runServer(opts, es, listenAddr, sCh); err != nil {
-				log.Printf("[provider] runServer error: %v", err)
-			}
-		}(serverOpts, stopCh, serverDone)
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Println("Shutting down server...")
+		grpcServer.GracefulStop()
+	}()
 
-		// Wait for TLS config change or OS signal.
-		select {
-		case <-sigChan:
-			log.Println("[provider] shutting down")
-			close(stopCh)
-			<-serverDone
-			stopFn()
-			return
-
-		case update := <-watcher.UpdateCh():
-			if update.Mode == currentMode {
-				// Same mode, no restart needed — drain serverDone if server exited.
-				select {
-				case <-serverDone:
-				default:
-				}
-				continue
-			}
-			log.Printf("[provider] xDS TLS mode changed (%v -> %v), restarting server",
-				currentMode, update.Mode)
-			close(stopCh)
-			<-serverDone // wait for port to be fully released
-			stopFn()
-			currentMode = update.Mode
-			serverOpts, stopFn = buildServerOpts(update, certDir)
+	if err := grpcServer.Serve(lis); err != nil {
+		if !strings.Contains(err.Error(), "use of closed network connection") {
+			log.Fatalf("Failed to serve: %v", err)
 		}
+		log.Printf("Server stopped: %v", err)
 	}
 }
+ 

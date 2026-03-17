@@ -8,6 +8,8 @@ require (
 	google.golang.org/protobuf v1.36.11
 )
 
+replace github.com/dubbo-kubernetes/xds-api => ../xds-api
+
 require (
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect

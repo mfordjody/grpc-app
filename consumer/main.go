@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -13,14 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	xdsresolver "github.com/dubbo-kubernetes/xds-api/grpc/resolver"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/reflection"
+
+	// Register the xds:/// resolver backed by xds-api (no envoy dependency)
+	_ "github.com/dubbo-kubernetes/xds-api/grpc/resolver"
+
 	"grpc-app/logger"
-	"grpc-app/mtls"
 	pb "grpc-app/proto"
 	"grpc-app/util"
 )
@@ -47,6 +50,7 @@ func main() {
 	log.Println("Shutting down...")
 
 	if testServer != nil {
+		log.Println("Stopping test server...")
 		testServer.GracefulStop()
 	}
 }
@@ -54,7 +58,6 @@ func main() {
 type cachedConnection struct {
 	conn      *grpc.ClientConn
 	createdAt time.Time
-	hasTLS    bool
 }
 
 type testServerImpl struct {
@@ -63,18 +66,20 @@ type testServerImpl struct {
 	connMutex sync.RWMutex
 }
 
-func startTestServer(p int) {
-	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", p))
+func startTestServer(port int) {
+	lis, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		log.Printf("Failed to listen on port %d: %v", p, err)
+		log.Printf("Failed to listen on port %d: %v", port, err)
 		return
 	}
+
 	testServer = grpc.NewServer()
 	pb.RegisterEchoTestServiceServer(testServer, &testServerImpl{
 		connCache: make(map[string]*cachedConnection),
 	})
 	reflection.Register(testServer)
-	log.Printf("Test server listening on port %d", p)
+
+	log.Printf("Test server listening on port %d for ForwardEcho (reflection enabled)", port)
 	if err := testServer.Serve(lis); err != nil {
 		log.Printf("Test server error: %v", err)
 	}
@@ -95,109 +100,100 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 	if count > 100 {
 		count = 100
 	}
+
 	log.Printf("ForwardEcho: url=%s, count=%d", req.Url, count)
 
-	// certDir is where dubbo-agent writes cert-chain.pem / key.pem / root-cert.pem.
-	certDir := os.Getenv("OUTPUT_CERTS")
-	if certDir == "" {
-		certDir = "/var/lib/dubbo/data"
+	bootstrapPath := os.Getenv("GRPC_XDS_BOOTSTRAP")
+	if bootstrapPath == "" {
+		return nil, fmt.Errorf("GRPC_XDS_BOOTSTRAP environment variable is not set")
+	}
+	if _, err := os.Stat(bootstrapPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("bootstrap file does not exist: %s", bootstrapPath)
 	}
 
-	// Determine whether xDS has pushed a TLS config for this target.
-	currentlyHasTLS := xdsresolver.GetClusterTLSForTarget(req.Url) != nil
-
-	const maxAge = 10 * time.Second
-
-	s.connMutex.RLock()
-	cached := s.connCache[req.Url]
-	s.connMutex.RUnlock()
-
-	var conn *grpc.ClientConn
-	if cached != nil {
-		state := cached.conn.GetState()
-		stale := time.Since(cached.createdAt) > maxAge
-		tlsChanged := cached.hasTLS != currentlyHasTLS
-		if state == connectivity.Shutdown || stale || tlsChanged {
-			s.connMutex.Lock()
-			if c, ok := s.connCache[req.Url]; ok {
-				c.conn.Close()
-				delete(s.connCache, req.Url)
+	bootstrapData, err := os.ReadFile(bootstrapPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read bootstrap file: %v", err)
+	}
+	var bootstrapJSON map[string]interface{}
+	if err := json.Unmarshal(bootstrapData, &bootstrapJSON); err != nil {
+		return nil, fmt.Errorf("failed to parse bootstrap file: %v", err)
+	}
+	// Verify UDS socket exists if configured
+	if xdsServers, ok := bootstrapJSON["xds_servers"].([]interface{}); ok && len(xdsServers) > 0 {
+		if server, ok := xdsServers[0].(map[string]interface{}); ok {
+			if serverURI, ok := server["server_uri"].(string); ok {
+				if strings.HasPrefix(serverURI, "unix://") {
+					udsPath := strings.TrimPrefix(serverURI, "unix://")
+					if _, err := os.Stat(udsPath); os.IsNotExist(err) {
+						return nil, fmt.Errorf("UDS socket does not exist: %s", udsPath)
+					}
+				}
 			}
-			s.connMutex.Unlock()
-			cached = nil
-		} else {
-			conn = cached.conn
 		}
 	}
 
-	if conn == nil {
-		s.connMutex.Lock()
-		if c, ok := s.connCache[req.Url]; ok && c != nil && c.conn.GetState() != connectivity.Shutdown {
-			conn = c.conn
+	const maxConnectionAge = 10 * time.Second
+
+	s.connMutex.RLock()
+	cached, exists := s.connCache[req.Url]
+	var conn *grpc.ClientConn
+	if exists && cached != nil {
+		conn = cached.conn
+	}
+	s.connMutex.RUnlock()
+
+	if exists && conn != nil {
+		state := conn.GetState()
+		if state == connectivity.Shutdown {
+			log.Printf("ForwardEcho: cached connection for %s is SHUTDOWN, removing", req.Url)
+			s.connMutex.Lock()
+			delete(s.connCache, req.Url)
+			conn = nil
+			exists = false
 			s.connMutex.Unlock()
-		} else {
-			log.Printf("ForwardEcho: creating new connection to %s (hasTLS=%v)", req.Url, currentlyHasTLS)
-
-			// Build transport credentials.
-			// xDS CDS pushes UpstreamTlsContext when DestinationRule sets DUBBO_MUTUAL.
-			// We use the mtls package (backed by dubbo-agent certificate files) to build
-			// standard Go TLS credentials — no envoy/istio dependency.
-			transportCreds := grpc.WithTransportCredentials(insecure.NewCredentials())
-			if tlsCtx := xdsresolver.GetClusterTLSForTarget(req.Url); tlsCtx != nil {
-				log.Printf("ForwardEcho: xDS supplied UpstreamTlsContext for %s, enabling mTLS (SNI=%s)", req.Url, tlsCtx.Sni)
-				tlsMgr := mtls.NewXDSCertificateManager(certDir)
-				defer tlsMgr.Stop()
-				certProvider, err := tlsMgr.ApplyUpstreamTLSContext(tlsCtx)
-				if err != nil {
-					log.Printf("ForwardEcho: failed to apply xDS TLS context: %v, falling back to insecure", err)
-				} else {
-					creds, err := certProvider.GetClientCredentials()
-					if err != nil {
-						log.Printf("ForwardEcho: failed to build TLS credentials: %v, falling back to insecure", err)
-					} else {
-						transportCreds = grpc.WithTransportCredentials(creds)
-						log.Printf("ForwardEcho: mTLS credentials applied for %s", req.Url)
-					}
-				}
-			} else {
-				log.Printf("ForwardEcho: no xDS TLS context for %s, using insecure", req.Url)
+		} else if time.Since(cached.createdAt) > maxConnectionAge {
+			log.Printf("ForwardEcho: cached connection for %s is too old, clearing", req.Url)
+			s.connMutex.Lock()
+			if c, ok := s.connCache[req.Url]; ok && c != nil && c.conn != nil {
+				c.conn.Close()
 			}
+			delete(s.connCache, req.Url)
+			conn = nil
+			exists = false
+			s.connMutex.Unlock()
+		}
+	}
 
+	if !exists || conn == nil {
+		s.connMutex.Lock()
+		if c, ok := s.connCache[req.Url]; !ok || c == nil || c.conn == nil {
+			log.Printf("ForwardEcho: creating new connection for %s...", req.Url)
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			newConn, dialErr := grpc.DialContext(
-				dialCtx,
-				req.Url,
-				transportCreds,
-				grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`),
-				grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-					// Strip the #N suffix added by the xDS weighted_target balancer.
-					if idx := strings.LastIndex(addr, "#"); idx >= 0 {
-						addr = addr[:idx]
-					}
-					return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-				}),
+			// xds:/// resolver (registered by xds-api/grpc/resolver) handles endpoint
+			// resolution without any envoy/go-control-plane dependency.
+			newConn, dialErr := grpc.DialContext(dialCtx, req.Url,
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			)
 			dialCancel()
 			if dialErr != nil {
 				s.connMutex.Unlock()
 				return nil, fmt.Errorf("failed to dial %s: %v", req.Url, dialErr)
 			}
+			s.connCache[req.Url] = &cachedConnection{conn: newConn, createdAt: time.Now()}
 			conn = newConn
-			s.connCache[req.Url] = &cachedConnection{
-				conn:      conn,
-				createdAt: time.Now(),
-				hasTLS:    currentlyHasTLS,
-			}
-			log.Printf("ForwardEcho: connection cached for %s", req.Url)
-			s.connMutex.Unlock()
+			log.Printf("ForwardEcho: cached connection for %s", req.Url)
+		} else {
+			conn = s.connCache[req.Url].conn
 		}
+		s.connMutex.Unlock()
 	} else {
 		log.Printf("ForwardEcho: reusing cached connection for %s (state: %v)", req.Url, conn.GetState())
 	}
 
-	// Wait for READY.
+	// Wait for connection to be ready (up to 60s)
 	if conn.GetState() != connectivity.Ready {
-		log.Printf("ForwardEcho: waiting for connection READY...")
+		log.Printf("ForwardEcho: waiting for connection to be ready (60s)...")
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer waitCancel()
 		for conn.GetState() != connectivity.Ready {
@@ -205,7 +201,7 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 				break
 			}
 		}
-		log.Printf("ForwardEcho: final connection state: %v", conn.GetState())
+		log.Printf("ForwardEcho: connection state after wait: %v", conn.GetState())
 	}
 
 	client := pb.NewEchoServiceClient(conn)
@@ -216,12 +212,8 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 	log.Printf("ForwardEcho: sending %d requests...", count)
 	for i := int32(0); i < count; i++ {
 		reqCtx, reqCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		start := time.Now()
 		resp, err := client.Echo(reqCtx, &pb.EchoRequest{Message: fmt.Sprintf("Request %d", i+1)})
-		dur := time.Since(start)
 		reqCancel()
-
-		log.Printf("ForwardEcho: request %d completed in %v (state: %v)", i+1, dur, conn.GetState())
 
 		if err != nil {
 			log.Printf("ForwardEcho: request %d failed: %v", i+1, err)
@@ -235,44 +227,34 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 			}
 			continue
 		}
-		if resp == nil {
-			output = append(output, fmt.Sprintf("[%d] Error: response is nil", i))
-			continue
-		}
 
-		log.Printf("ForwardEcho: request %d succeeded: Hostname=%s ServiceVersion=%s Namespace=%s IP=%s",
-			i+1, resp.Hostname, resp.ServiceVersion, resp.Namespace, resp.Ip)
-
-		parts := []string{fmt.Sprintf("[%d body] Hostname=%s", i, resp.Hostname)}
+		log.Printf("ForwardEcho: request %d succeeded: Hostname=%s", i+1, resp.Hostname)
+		lineParts := []string{fmt.Sprintf("[%d body] Hostname=%s", i, resp.Hostname)}
 		if resp.ServiceVersion != "" {
-			parts = append(parts, fmt.Sprintf("ServiceVersion=%s", resp.ServiceVersion))
+			lineParts = append(lineParts, fmt.Sprintf("ServiceVersion=%s", resp.ServiceVersion))
 		}
 		if resp.Namespace != "" {
-			parts = append(parts, fmt.Sprintf("Namespace=%s", resp.Namespace))
+			lineParts = append(lineParts, fmt.Sprintf("Namespace=%s", resp.Namespace))
 		}
 		if resp.Ip != "" {
-			parts = append(parts, fmt.Sprintf("IP=%s", resp.Ip))
+			lineParts = append(lineParts, fmt.Sprintf("IP=%s", resp.Ip))
 		}
 		if resp.Cluster != "" {
-			parts = append(parts, fmt.Sprintf("Cluster=%s", resp.Cluster))
+			lineParts = append(lineParts, fmt.Sprintf("Cluster=%s", resp.Cluster))
 		}
 		if resp.ServicePort > 0 {
-			parts = append(parts, fmt.Sprintf("ServicePort=%d", resp.ServicePort))
+			lineParts = append(lineParts, fmt.Sprintf("ServicePort=%d", resp.ServicePort))
 		}
-		output = append(output, strings.Join(parts, " "))
-
+		output = append(output, strings.Join(lineParts, " "))
 		if i < count-1 {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
 
 	log.Printf("ForwardEcho: completed %d requests", count)
-
 	if errorCount > 0 && errorCount == int(count) && firstError != "" {
-		summary := fmt.Sprintf("ERROR:\nCode: Unknown\nMessage: %d/%d requests had errors; first error: %s",
-			errorCount, count, firstError)
+		summary := fmt.Sprintf("ERROR:\nCode: Unknown\nMessage: %d/%d requests had errors; first error: %s", errorCount, count, firstError)
 		output = append([]string{summary}, output...)
 	}
-
 	return &pb.ForwardEchoResponse{Output: output}, nil
 }

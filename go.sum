@@ -1,11 +1,5 @@
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316184808-875b9fdd4311 h1:VaVybv8Lj6LPAwcEg9AhtBX6uRpktsICkDEe4Ux0IBM=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316184808-875b9fdd4311/go.mod h1:qTuiKuHP/sQnQ+iPG5LHcbg2YNW+MwK44YuoDKGuvfI=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316192701-ea3fff5ed822 h1:wlRZnAPrKGw0GpPQamjrtTJy2ghnwiUt3oyU4/iiax4=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316192701-ea3fff5ed822/go.mod h1:qTuiKuHP/sQnQ+iPG5LHcbg2YNW+MwK44YuoDKGuvfI=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316194656-229a63bd92e4 h1:qqK1N5HaFMGsrMTMHm1eqFXCur0idOVujwlmNu/9YQM=
-github.com/dubbo-kubernetes/xds-api v0.0.0-20260316194656-229a63bd92e4/go.mod h1:qTuiKuHP/sQnQ+iPG5LHcbg2YNW+MwK44YuoDKGuvfI=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
 github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
