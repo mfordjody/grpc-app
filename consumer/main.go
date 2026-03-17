@@ -171,7 +171,7 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 			log.Printf("ForwardEcho: creating new connection for %s...", req.Url)
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
 			// xds:/// resolver (registered by xds-api/grpc/resolver) handles endpoint
-			// resolution without any envoy/go-control-plane dependency.
+			// resolution and injects round_robin via ServiceConfig.
 			newConn, dialErr := grpc.DialContext(dialCtx, req.Url,
 				grpc.WithTransportCredentials(insecure.NewCredentials()),
 			)
