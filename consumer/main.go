@@ -16,27 +16,20 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/reflection"
 
-	// Register the xds:/// resolver backed by xds-api (no envoy dependency)
+	// Importing resolver registers the xds:/// scheme, the xds_weighted balancer,
+	// and automatic per-connection mTLS via xDS CDS — zero TLS code in the app.
 	_ "github.com/dubbo-kubernetes/xds-api/grpc/resolver"
+
+	// DialOptions() injects the xDS transport credentials transparently.
+	xdsserver "github.com/dubbo-kubernetes/xds-api/grpc/server"
 
 	"grpc-app/logger"
 	pb "grpc-app/proto"
 	"grpc-app/util"
 )
-
-// stripSuffixDialer strips the "#N" suffix that xds-api resolver appends to
-// make weighted round-robin slots distinct. The actual TCP dial uses the real
-// host:port without the suffix.
-func stripSuffixDialer(ctx context.Context, addr string) (net.Conn, error) {
-	if idx := strings.LastIndex(addr, "#"); idx >= 0 {
-		addr = addr[:idx]
-	}
-	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-}
 
 var (
 	port       = flag.Int("port", 17171, "gRPC server port for ForwardEcho testing")
@@ -129,10 +122,10 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 	if err := json.Unmarshal(bootstrapData, &bootstrapJSON); err != nil {
 		return nil, fmt.Errorf("failed to parse bootstrap file: %v", err)
 	}
-	// Verify UDS socket exists if configured
+	// Verify UDS socket exists if configured.
 	if xdsServers, ok := bootstrapJSON["xds_servers"].([]interface{}); ok && len(xdsServers) > 0 {
-		if server, ok := xdsServers[0].(map[string]interface{}); ok {
-			if serverURI, ok := server["server_uri"].(string); ok {
+		if srv, ok := xdsServers[0].(map[string]interface{}); ok {
+			if serverURI, ok := srv["server_uri"].(string); ok {
 				if strings.HasPrefix(serverURI, "unix://") {
 					udsPath := strings.TrimPrefix(serverURI, "unix://")
 					if _, err := os.Stat(udsPath); os.IsNotExist(err) {
@@ -180,12 +173,10 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 		if c, ok := s.connCache[req.Url]; !ok || c == nil || c.conn == nil {
 			log.Printf("ForwardEcho: creating new connection for %s...", req.Url)
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
-			// xds:/// resolver injects round_robin + #N suffix for weighted slots.
-			// stripSuffixDialer removes the suffix before the actual TCP dial.
-			newConn, dialErr := grpc.DialContext(dialCtx, req.Url,
-				grpc.WithTransportCredentials(insecure.NewCredentials()),
-				grpc.WithContextDialer(stripSuffixDialer),
-			)
+			// server.DialContext automatically injects xDS-aware transport
+			// credentials — mTLS when control plane pushes DUBBO_MUTUAL,
+			// plaintext otherwise.  No TLS code needed in the application.
+			newConn, dialErr := xdsserver.DialContext(dialCtx, req.Url)
 			dialCancel()
 			if dialErr != nil {
 				s.connMutex.Unlock()
@@ -202,7 +193,7 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 		log.Printf("ForwardEcho: reusing cached connection for %s (state: %v)", req.Url, conn.GetState())
 	}
 
-	// Wait for connection to be ready (up to 60s)
+	// Wait for connection to be ready (up to 60 s).
 	if conn.GetState() != connectivity.Ready {
 		log.Printf("ForwardEcho: waiting for connection to be ready (60s)...")
 		waitCtx, waitCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -264,8 +255,9 @@ func (s *testServerImpl) ForwardEcho(ctx context.Context, req *pb.ForwardEchoReq
 
 	log.Printf("ForwardEcho: completed %d requests", count)
 	if errorCount > 0 && errorCount == int(count) && firstError != "" {
-		summary := fmt.Sprintf("ERROR:\nCode: Unknown\nMessage: %d/%d requests had errors; first error: %s", errorCount, count, firstError)
+		summary := fmt.Sprintf("ERROR:\nCode: Unknown\nMessage: %d/%d requests had errors; first error: %s",
+			errorCount, count, firstError)
 		output = append([]string{summary}, output...)
 	}
 	return &pb.ForwardEchoResponse{Output: output}, nil
-}
+} 

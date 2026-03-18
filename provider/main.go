@@ -5,19 +5,17 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/reflection"
 
+	// NewGRPCServer handles all xDS TLS lifecycle automatically.
 	"github.com/dubbo-kubernetes/xds-api/grpc/server"
 
 	"grpc-app/logger"
@@ -161,29 +159,10 @@ func main() {
 
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 
-	// Watch inbound xDS listener for TLS config via xds-api server watcher
-	// (no envoy/go-control-plane dependency).
-	watcher := server.NewWatcher(addr, bootstrapPath)
-	watcher.Start()
-	defer watcher.Close()
-
-	// Wait for initial xDS config (up to 30s), then start serving.
-	// If no config arrives we fall back to plaintext.
-	var grpcServer *grpc.Server
-	initCtx, initCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	tlsCfg, err := watcher.WaitForInitial(initCtx)
-	initCancel()
-
-	if err != nil || tlsCfg == nil || tlsCfg.Mode != server.TLSModeMTLS {
-		log.Printf("Starting provider in plaintext mode (xDS TLS config: %v, err: %v)", tlsCfg, err)
-		grpcServer = grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
-	} else {
-		log.Printf("Starting provider in mTLS mode from xDS config")
-		// For now start plaintext; a future step can wire up the DownstreamTlsContext
-		// from tlsCfg.Downstream into grpc.Creds once a credentials adapter is added
-		// to xds-api/grpc/server.
-		grpcServer = grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
-	}
+	// --- Pure business logic below. No TLS, no credentials, no watcher. ---
+	// NewGRPCServer transparently handles plaintext ↔ mTLS switching based on
+	// PeerAuthentication policies pushed by the xDS control plane.
+	srv := server.NewGRPCServer(addr, bootstrapPath)
 
 	es := &echoServer{
 		hostname:       hostname,
@@ -193,30 +172,22 @@ func main() {
 		cluster:        cluster,
 		servicePort:    servicePort,
 	}
-	pb.RegisterEchoServiceServer(grpcServer, es)
-	pb.RegisterEchoTestServiceServer(grpcServer, es)
-	reflection.Register(grpcServer)
+	srv.RegisterService(&pb.EchoService_ServiceDesc, es)
+	srv.RegisterService(&pb.EchoTestService_ServiceDesc, es)
 
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+	// Register gRPC reflection using the managed server's internal registration
+	// hook so grpcurl can introspect without a proto file.
+	srv.RegisterHook(func(s *grpc.Server) {
+		reflection.Register(s)
+	})
+
+	log.Printf("Starting gRPC provider on %s (hostname: %s)", addr, hostname)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := srv.ServeContext(ctx); err != nil && err != context.Canceled {
+		log.Fatalf("provider exited: %v", err)
 	}
-
-	log.Printf("Starting gRPC provider server on port %d (hostname: %s)", *port, hostname)
-
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
-		log.Println("Shutting down server...")
-		grpcServer.GracefulStop()
-	}()
-
-	if err := grpcServer.Serve(lis); err != nil {
-		if !strings.Contains(err.Error(), "use of closed network connection") {
-			log.Fatalf("Failed to serve: %v", err)
-		}
-		log.Printf("Server stopped: %v", err)
-	}
+	log.Println("provider shut down cleanly")
 }
- 
